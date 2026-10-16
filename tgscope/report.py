@@ -47,8 +47,11 @@ def findings(r: Report) -> list[str]:
         )
     share = sum(r.forwards.values()) / len(r.posts) if r.posts else 0
     if share >= 0.05:
-        name, count = r.forwards.most_common(1)[0]
-        out.append(f"{share:.0%} постов — репосты. Чаще всего из «{name}» ({count} шт.).")
+        key, count = r.forwards.most_common(1)[0]
+        source = (
+            f"«{r.forward_titles[key]}» ({r.source_url(key)})" if r.source_url(key) else f"«{key}»"
+        )
+        out.append(f"{share:.0%} постов — репосты. Чаще всего из {source}, {count} шт.")
     if r.missing_ids:
         out.append(
             f"В нумерации постов {r.missing_ids} пропусков. Это удалённые посты, "
@@ -88,9 +91,17 @@ def render_text(r: Report) -> str:
         "  " + "".join(str(h // 10) if h % 6 == 0 else " " for h in range(24)),
         "  " + "".join(str(h % 10) if h % 6 == 0 else " " for h in range(24)),
     ]
+    if r.forwards:
+        lines += ["", "Откуда репостит:"]
+        for key, count in r.forwards.most_common(8):
+            url = r.source_url(key)
+            label = f"{url}  {r.forward_titles[key]}" if url else f"{key}{_no_link(key)}"
+            lines.append(f"  {count:>4}  {label}")
     sections: list[tuple[str, Counter[str]]] = [
-        ("Откуда репостит", r.forwards),
-        ("Какие каналы упоминает", Counter({f"@{k}": v for k, v in r.mentioned_channels.items()})),
+        (
+            "Какие каналы упоминает",
+            Counter({f"https://t.me/{k}": v for k, v in r.mentioned_channels.items()}),
+        ),
         ("Куда ведут ссылки", r.domains),
         ("Хэштеги", Counter({f"#{k}": v for k, v in r.hashtags.items()})),
     ]
@@ -102,11 +113,16 @@ def render_text(r: Report) -> str:
         lines += ["", "Самые просматриваемые:"]
         for p in r.top_posts:
             preview = p.text.replace("\n", " ")[:60] or "[" + ", ".join(p.media) + "]"
-            lines.append(f"  {fmt_num(p.views):>6}  t.me/{c.username}/{p.id}  {preview}")
+            lines.append(f"  {fmt_num(p.views):>6}  https://t.me/{c.username}/{p.id}  {preview}")
     if found := findings(r):
         lines += ["", "Что видно:"]
         lines += [f"  • {f}" for f in found]
     return "\n".join(lines)
+
+
+def _no_link(key: str) -> str:
+    # The hidden-source placeholder already says why there is no link.
+    return "" if key.startswith("(") else " (без ссылки)"
 
 
 def _sparkline(values: list[int]) -> str:
@@ -128,7 +144,15 @@ def render_json(r: Report) -> str:
         "posts_per_day": round(r.per_day, 2),
         "median_views": r.median_views,
         "heatmap": r.heatmap,
-        "forwards": dict(r.forwards.most_common()),
+        "forwards": [
+            {
+                "channel": key if r.source_url(key) else None,
+                "title": r.forward_titles.get(key, key),
+                "url": r.source_url(key),
+                "count": count,
+            }
+            for key, count in r.forwards.most_common()
+        ],
         "mentioned_channels": dict(r.mentioned_channels.most_common()),
         "domains": dict(r.domains.most_common()),
         "hashtags": dict(r.hashtags.most_common()),
@@ -162,14 +186,17 @@ def render_html(r: Report) -> str:
         f'<div class="hr">{h if h % 3 == 0 else ""}</div>' for h in range(24)
     )
 
-    def table(title: str, counter: Counter[str], link: Any = None) -> str:
+    def table(title: str, counter: Counter[str], link: Any = None, note: Any = None) -> str:
+        """Rows of name/count/bar; linked names are shown as @username, `note` adds grey text."""
         if not counter:
             return ""
         biggest = counter.most_common(1)[0][1]
         rows = []
         for name, count in counter.most_common(15):
             href = link(name) if link else None
-            label = f'<a href="{e(href)}" rel="noreferrer">{e(name)}</a>' if href else e(name)
+            label = f'<a href="{e(href)}" rel="noreferrer">@{e(name)}</a>' if href else e(name)
+            if extra := (note(name) if note else None):
+                label += f' <span class="muted">{e(extra)}</span>'
             rows.append(
                 f'<tr><td>{label}</td><td class="n">{count}</td>'
                 f'<td class="bar"><span style="width:{count / biggest * 100:.0f}%"></span></td></tr>'
@@ -221,6 +248,7 @@ td.bar{{width:30%}} td.bar span{{display:block;height:8px;margin-top:7px;backgro
 a{{color:var(--acc);text-decoration:none;word-break:break-word}} a:hover{{text-decoration:underline}}
 .cols{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:0 32px}}
 ul{{padding-left:20px;margin:0}} li{{margin-bottom:6px}}
+.muted{{color:var(--muted);font-size:13px}}
 footer{{color:var(--muted);font-size:13px;border-top:1px solid var(--line);padding-top:16px}}
 </style></head><body><main>
 <h1>{e(c.title or "@" + c.username)}{" ✔" if c.verified else ""}</h1>
@@ -230,7 +258,7 @@ footer{{color:var(--muted);font-size:13px;border-top:1px solid var(--line);paddi
 {f"<section><h2>Что видно</h2><ul>{notes}</ul></section>" if notes else ""}
 <section><h2>Когда публикует ({e(r.tz_label)})</h2><div class="heat">{hours}{"".join(cells)}</div></section>
 <div class="cols">
-{table("Откуда репостит", r.forwards, lambda n: r.forward_urls.get(n))}
+{table("Откуда репостит", r.forwards, r.source_url, lambda n: r.forward_titles.get(n, _no_link(n).strip(" ()")))}
 {table("Какие каналы упоминает", r.mentioned_channels, lambda n: f"https://t.me/{n}")}
 {table("Куда ведут ссылки", r.domains)}
 {table("Хэштеги", r.hashtags)}

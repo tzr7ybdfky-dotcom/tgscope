@@ -14,6 +14,7 @@ from .parse import ChannelInfo, Post, tme_channel
 MENTION_RE = re.compile(r"(?<![\w@])@([A-Za-z][A-Za-z0-9_]{3,31})\b")
 HASHTAG_RE = re.compile(r"(?<!\w)#(\w{2,64})")
 NIGHT_HOURS = 5  # length of the quiet window used to guess the author's night
+QUIET_RATIO = 0.25  # the window's hourly rate must be at most this share of the other hours'
 
 
 @dataclass
@@ -38,8 +39,10 @@ class Report:
     by_hour: list[int] = field(default_factory=lambda: [0] * 24)
     median_views: int | None = None
     top_posts: list[Post] = field(default_factory=list)
+    # Keyed by @username when the source is linkable (titles are not unique),
+    # otherwise by the displayed name, e.g. a hidden source.
     forwards: Counter[str] = field(default_factory=Counter)
-    forward_urls: dict[str, str] = field(default_factory=dict)
+    forward_titles: dict[str, str] = field(default_factory=dict)
     mentioned_channels: Counter[str] = field(default_factory=Counter)
     domains: Counter[str] = field(default_factory=Counter)
     hashtags: Counter[str] = field(default_factory=Counter)
@@ -54,6 +57,9 @@ class Report:
     @property
     def missing_ids(self) -> int:
         return sum(g.missing for g in self.gaps)
+
+    def source_url(self, key: str) -> str | None:
+        return f"https://t.me/{key}" if key in self.forward_titles else None
 
 
 def analyze(channel: ChannelInfo, posts: list[Post], tz: tzinfo, tz_label: str) -> Report:
@@ -82,20 +88,21 @@ def analyze(channel: ChannelInfo, posts: list[Post], tz: tzinfo, tz_label: str) 
     own = channel.username.lower()
     for post in posts:
         if post.forwarded_from:
-            report.forwards[post.forwarded_from] += 1
-            if post.forwarded_url:
-                report.forward_urls.setdefault(post.forwarded_from, post.forwarded_url)
+            source = tme_channel(post.forwarded_url) if post.forwarded_url else None
+            if source:
+                report.forward_titles.setdefault(source, post.forwarded_from)
+            report.forwards[source or post.forwarded_from] += 1
+        # A post that both links t.me/x and writes @x mentions x once.
+        mentioned = {m.lower() for m in MENTION_RE.findall(post.text)}
         for link in post.links:
             name = tme_channel(link)
-            if name and name != own:
-                report.mentioned_channels[name] += 1
-            elif not name:
+            if name:
+                mentioned.add(name)
+            else:
                 host = (urlparse(link).hostname or "").removeprefix("www.")
                 if host and host not in {"t.me", "telegram.me"}:
                     report.domains[host] += 1
-        for mention in MENTION_RE.findall(post.text):
-            if mention.lower() != own:
-                report.mentioned_channels[mention.lower()] += 1
+        report.mentioned_channels.update(mentioned - {own})
         report.hashtags.update(tag.lower() for tag in HASHTAG_RE.findall(post.text))
         if post.author:
             report.authors[post.author] += 1
@@ -105,8 +112,8 @@ def analyze(channel: ChannelInfo, posts: list[Post], tz: tzinfo, tz_label: str) 
     ids = [p.id for p in posts]
     report.gaps = [Gap(a, b) for a, b in zip(ids, ids[1:], strict=False) if b - a > 1]
 
-    if len(dated) >= 30:
-        report.quiet_window, report.utc_offset_guess = guess_night(utc_hours)
+    if len(dated) >= 30 and (guess := guess_night(utc_hours)):
+        report.quiet_window, report.utc_offset_guess = guess
 
     ordered = sorted(dated, key=lambda p: p.date or datetime.min)
     pauses = [(a.date, b.date) for a, b in zip(ordered, ordered[1:], strict=False)]
@@ -117,14 +124,19 @@ def analyze(channel: ChannelInfo, posts: list[Post], tz: tzinfo, tz_label: str) 
     return report
 
 
-def guess_night(utc_hours: list[int]) -> tuple[tuple[int, int], int]:
+def guess_night(utc_hours: list[int]) -> tuple[tuple[int, int], int] | None:
     """Find the quietest NIGHT_HOURS-long window (UTC) and assume it is ~01:00–06:00 local.
 
     When several windows are equally quiet, take the middle of the longest run of them,
     so a long empty stretch is centred instead of picking its first hour.
+    Returns None when no window is clearly quieter than the rest of the day,
+    e.g. a channel that posts around the clock.
     """
     sums = [sum(utc_hours[(s + i) % 24] for i in range(NIGHT_HOURS)) for s in range(24)]
     quietest = min(sums)
+    rest_rate = (sum(utc_hours) - quietest) / (24 - NIGHT_HOURS)
+    if rest_rate == 0 or quietest / NIGHT_HOURS > QUIET_RATIO * rest_rate:
+        return None
     best_run: tuple[int, int] = (0, 0)  # (length, start)
     for start in range(24):
         if sums[start] != quietest or sums[(start - 1) % 24] == quietest:

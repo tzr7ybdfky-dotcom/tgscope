@@ -1,4 +1,4 @@
-from datetime import UTC
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import httpx
@@ -6,8 +6,8 @@ import pytest
 
 from tgscope.analyze import analyze, guess_night
 from tgscope.cli import parse_tz
-from tgscope.fetch import ChannelError, fetch_channel, normalize_channel
-from tgscope.parse import parse_channel, parse_count, parse_posts, tme_channel
+from tgscope.fetch import ChannelError, fetch_channel, normalize_channel, retry_after
+from tgscope.parse import ChannelInfo, Post, parse_channel, parse_count, parse_posts, tme_channel
 from tgscope.report import findings, render_html, render_json, render_text
 
 PAGE = (Path(__file__).parent / "fixtures" / "page.html").read_text(encoding="utf-8")
@@ -58,7 +58,10 @@ def test_parse_channel_and_posts():
 def test_analyze_counts_and_gaps():
     info = parse_channel(PAGE, "demochannel")
     report = analyze(info, parse_posts(PAGE), *parse_tz("+3"))
-    assert report.forwards == {"Source Chan": 1, "(скрытый источник)": 1}
+    assert report.forwards == {"sourcechan": 1, "(скрытый источник)": 1}
+    assert report.forward_titles == {"sourcechan": "Source Chan"}
+    assert report.source_url("sourcechan") == "https://t.me/sourcechan"
+    assert report.source_url("(скрытый источник)") is None
     assert report.mentioned_channels == {"otherchan": 1, "sourcechan": 1}
     assert report.domains == {"example.com": 1}
     assert report.hashtags == {"новости": 1}
@@ -123,3 +126,69 @@ def test_fetch_rejects_private_channel():
     client = httpx.Client(transport=empty)
     with pytest.raises(ChannelError):
         fetch_channel("demochannel", client=client, delay=0)
+
+
+def test_guess_night_needs_a_clearly_quiet_window():
+    assert guess_night([5] * 24) is None  # posts around the clock
+    assert guess_night([3] * 5 + [4] * 19) is None  # slightly quieter is not "night"
+    assert guess_night([0] * 24) is None
+
+
+def test_mention_and_link_to_same_channel_count_once():
+    post = Post(
+        id=1,
+        date=datetime(2026, 1, 1, tzinfo=UTC),
+        text="см @OtherChan и @demochannel",
+        links=["https://t.me/otherchan", "https://t.me/thirdchan/5"],
+    )
+    report = analyze(ChannelInfo("demochannel"), [post], UTC, "UTC")
+    assert report.mentioned_channels == {"otherchan": 1, "thirdchan": 1}
+
+
+def test_parse_tz_keeps_sign_of_zero_hours():
+    assert parse_tz("-00:30")[0].utcoffset(None) == -timedelta(minutes=30)
+    assert parse_tz("UTC-05:30")[0].utcoffset(None) == -timedelta(hours=5, minutes=30)
+    assert parse_tz("+05:45")[0].utcoffset(None) == timedelta(hours=5, minutes=45)
+
+
+def test_retry_after_is_honoured_in_full(monkeypatch):
+    assert retry_after("120", default=2) == 120
+    assert retry_after(None, default=4) == 4
+    assert retry_after("garbage", default=4) == 4
+
+    slept = []
+    monkeypatch.setattr("tgscope.fetch.time.sleep", slept.append)
+    responses = iter(
+        [httpx.Response(429, headers={"Retry-After": "120"}), httpx.Response(200, text="ok")]
+    )
+    client = httpx.Client(transport=httpx.MockTransport(lambda r: next(responses)))
+    from tgscope.fetch import _get
+
+    assert _get(client, "https://t.me/s/demochannel").text == "ok"
+    assert slept == [120]
+
+
+def test_too_long_retry_after_stops_instead_of_hanging(monkeypatch):
+    monkeypatch.setattr("tgscope.fetch.time.sleep", lambda s: None)
+    blocked = httpx.MockTransport(lambda r: httpx.Response(429, headers={"Retry-After": "3600"}))
+    with pytest.raises(ChannelError, match="60 мин"):
+        fetch_channel("demochannel", client=httpx.Client(transport=blocked), delay=0)
+
+
+def test_channels_with_the_same_title_stay_separate():
+    def repost(post_id, source):
+        return Post(
+            id=post_id,
+            date=datetime(2026, 1, 1, tzinfo=UTC),
+            forwarded_from="Новости",
+            forwarded_url=f"https://t.me/{source}/1",
+        )
+
+    posts = [repost(1, "news_one"), repost(2, "news_two"), repost(3, "news_two")]
+    report = analyze(ChannelInfo("demochannel"), posts, UTC, "UTC")
+    assert report.forwards == {"news_two": 2, "news_one": 1}
+    text = render_text(report)
+    assert "https://t.me/news_one  Новости" in text and "https://t.me/news_two  Новости" in text
+    page = render_html(report)
+    assert 'href="https://t.me/news_one"' in page and 'href="https://t.me/news_two"' in page
+    assert '"url": "https://t.me/news_two"' in render_json(report)

@@ -6,12 +6,14 @@ import re
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 
 import httpx
 
 from .parse import ChannelInfo, Post, is_public_preview, parse_channel, parse_posts
 
+MAX_WAIT = 300  # longer server-requested pauses end the run instead of hanging silently
 USER_AGENT = "Mozilla/5.0 (compatible; tgscope/0.1; +public channel preview analysis)"
 
 
@@ -79,10 +81,28 @@ def _get(client: httpx.Client, url: str, params: dict[str, int] | None = None) -
     for attempt in range(4):
         response = client.get(url, params=params)
         if response.status_code == 429 or response.status_code >= 500:
-            wait = float(response.headers.get("Retry-After", 2 ** (attempt + 1)))
+            wait = retry_after(response.headers.get("Retry-After"), default=2 ** (attempt + 1))
+            if wait > MAX_WAIT:
+                raise ChannelError(
+                    f"Telegram просит подождать {wait / 60:.0f} мин. Попробуйте позже."
+                )
             print(f"\nTelegram просит подождать {wait:.0f} с…", file=sys.stderr)
-            time.sleep(min(wait, 60))
+            time.sleep(wait)
             continue
         response.raise_for_status()
         return response
     raise ChannelError("Telegram слишком долго ограничивает запросы, попробуйте позже.")
+
+
+def retry_after(value: str | None, default: float) -> float:
+    """Seconds to wait from a Retry-After header: delta-seconds or an HTTP date."""
+    if not value:
+        return default
+    try:
+        return max(float(value), 0)
+    except ValueError:
+        pass
+    try:
+        return max((parsedate_to_datetime(value) - datetime.now(UTC)).total_seconds(), 0)
+    except (TypeError, ValueError):
+        return default

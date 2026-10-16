@@ -20,9 +20,9 @@ from .report import render_html, render_json, render_text
 
 def parse_tz(value: str) -> tuple[tzinfo, str]:
     if match := re.fullmatch(r"(?:UTC)?([+-]\d{1,2})(?::?(\d\d))?", value, re.IGNORECASE):
-        hours = int(match.group(1))
-        minutes = int(match.group(2) or 0) * (1 if hours >= 0 else -1)
-        offset = timedelta(hours=hours, minutes=minutes)
+        # Take the sign from the text: int("-00") is 0, which would lose it for "-00:30".
+        sign = -1 if match.group(1).startswith("-") else 1
+        offset = sign * timedelta(hours=abs(int(match.group(1))), minutes=int(match.group(2) or 0))
         label = f"UTC{match.group(1)}" + (f":{match.group(2)}" if match.group(2) else "")
         return timezone(offset), label
     if value.upper() == "UTC":
