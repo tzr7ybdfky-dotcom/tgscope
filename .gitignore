@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.DS_Store
+# отчёты с реальными данными каналов — только локально
+reports/
+*.json
+!tests/fixtures/*.json
