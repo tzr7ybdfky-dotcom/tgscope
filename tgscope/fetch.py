@@ -13,6 +13,7 @@ import httpx
 
 from .parse import ChannelInfo, Post, is_public_preview, parse_channel, parse_posts
 
+DEFAULT_LIMIT = 3000
 MAX_WAIT = 300  # longer server-requested pauses end the run instead of hanging silently
 USER_AGENT = "Mozilla/5.0 (compatible; tgscope/0.1; +public channel preview analysis)"
 
@@ -32,7 +33,7 @@ def normalize_channel(value: str) -> str:
 
 def fetch_channel(
     channel: str,
-    limit: int = 300,
+    limit: int = DEFAULT_LIMIT,
     since: datetime | None = None,
     delay: float = 1.0,
     timeout: float = 20,

@@ -14,7 +14,7 @@ import httpx
 
 from . import __version__
 from .analyze import analyze
-from .fetch import ChannelError, fetch_channel, normalize_channel
+from .fetch import DEFAULT_LIMIT, ChannelError, fetch_channel, normalize_channel
 from .report import render_html, render_json, render_text
 
 
@@ -52,7 +52,10 @@ def build_parser() -> argparse.ArgumentParser:
         description="Анализ публичного Telegram-канала: когда пишет, откуда репостит, куда ведёт.",
     )
     p.add_argument("channel", help="имя канала: durov, @durov или https://t.me/durov")
-    p.add_argument("-n", "--limit", type=int, default=300, help="сколько последних постов (300)")
+    p.add_argument(
+        "-n", "--limit", type=int, default=DEFAULT_LIMIT,
+        help="сколько последних постов (по умолчанию %(default)s)",
+    )
     p.add_argument("--since", type=parse_since, help="не раньше даты: 2026-01-31 или 30d")
     p.add_argument(
         "--tz",
